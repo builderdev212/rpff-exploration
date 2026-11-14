@@ -12,11 +12,12 @@ from typing import BinaryIO
 import numpy as np
 from scipy.fft import dctn, idctn
 from PIL import Image, ImageFile
+from dahuffman import HuffmanCodec
 
-TF_BLOCK_SIZE = 16
-QUANT_Y_MULT = 10
-QUANT_CHROMA_MULT = 20
-QUANT_Y_BITS = 4
+TF_BLOCK_SIZE = 8
+QUANT_Y_MULT = 30
+QUANT_CHROMA_MULT = 60
+QUANT_Y_BITS = 3
 QUANT_CHROMA_BITS = 2
 
 
@@ -75,27 +76,34 @@ def transform_blocks(channel: np.ndarray, inverse: bool = False) -> np.ndarray:
     return output.reshape(height, width)
 
 
-def pack_signed(channel: np.ndarray, bits_per_pixel: int) -> bytes:
+def pack_signed(ac: list[tuple[np.ndarray, int]], bits_per_pixel: int) -> bytes:
     offset = 1 << (bits_per_pixel - 1)
-    channel = channel.ravel().astype(np.int16)
-
-    # Ensure values fit within given range
-    if np.any((channel < -offset) | (channel >= offset)):
-        raise (
-            ValueError(
-                f"Data out of range for packed signed integer of {bits_per_pixel} bits."
-            )
-        )
-
-    # Map int to uint
-    codes = (channel + offset).astype(np.uint8)
-
-    # Convert to bits
     bit_shift = np.arange(bits_per_pixel)
-    bit_arr = ((codes[:, None] >> bit_shift) & 1).astype(np.uint8)
-    bit_arr = np.packbits(bit_arr.ravel(), bitorder="little")
+    packed_output = bytearray()
 
-    return bit_arr.tobytes()
+    for channel, trailing_zero in ac:
+        channel = channel.ravel().astype(np.int16)
+
+        # Ensure values fit within given range
+        if np.any((channel < -offset) | (channel >= offset)):
+            raise (
+                ValueError(
+                    f"Data out of range for packed signed integer of {bits_per_pixel} bits."
+                )
+            )
+
+        # Map int to uint
+        codes = (channel + offset).astype(np.uint8)
+
+        # Convert to bits
+        bit_arr = ((codes[:, None] >> bit_shift) & 1).astype(np.uint8)
+        bit_arr = np.packbits(bit_arr.ravel(), bitorder="little")
+
+        # Store into bytearray with zero count and truncated data
+        packed_output.extend(bytes([trailing_zero]))
+        packed_output.extend(bit_arr.tobytes())
+
+    return bytes(packed_output)
 
 
 def unpack_signed(raw: bytes, bits_per_pixel: int, pixels: int) -> np.ndarray:
@@ -133,16 +141,20 @@ class RPFFDecoder(ImageFile.PyDecoder):
         p_rows = rows + (-rows) % TF_BLOCK_SIZE
         p_columns = columns + (-columns) % TF_BLOCK_SIZE
         dc_count = (p_rows // TF_BLOCK_SIZE) * (p_columns // TF_BLOCK_SIZE)
-        ac_count = p_rows * p_columns - dc_count
 
         # Get DC Values
-        dc = self._read(dc_count * 2)  # DC values are 16 bits
-        dc = np.frombuffer(dc, dtype=np.int16)
+        dc = self._read(dc_count)  # DC values are 8 bits
+        dc = np.frombuffer(dc, dtype=np.int8)
 
         # Get AC Values
-        ac_byte_count = (ac_count * bits_per_pixel + 7) // 8
-        ac = self._read(ac_byte_count)
-        ac = unpack_signed(ac, bits_per_pixel, ac_count)
+        ac_per_block = TF_BLOCK_SIZE**2 - 1
+        ac = np.zeros((dc_count, ac_per_block), dtype=np.int8)
+        for block in range(dc_count):
+            trailing_zeros = self._read(1)[0]
+            remaining = ac_per_block - trailing_zeros
+            block_byte_count = (remaining * bits_per_pixel + 7) // 8
+            packed = self._read(block_byte_count)
+            ac[block, :remaining] = unpack_signed(packed, bits_per_pixel, remaining)
 
         # Repack Values together
         zz_blocks = np.empty(
@@ -266,6 +278,22 @@ def chroma_subsample(channel: np.ndarray) -> np.ndarray:
     return channel
 
 
+def truncate_zero_runs(ac: np.ndarray) -> list[tuple[np.ndarray, int]]:
+    trunc_ac = []
+
+    for block in ac.reshape(-1, ac.shape[-1]):
+        nonzero_ac = np.flatnonzero(block)
+
+        if nonzero_ac.size == 0:
+            trailing_zero = block.size
+        else:
+            trailing_zero = block.size - 1 - nonzero_ac[-1]
+
+        trunc_ac.append((block[: block.size - trailing_zero], trailing_zero))
+
+    return trunc_ac
+
+
 def embed_dc_in_channel(channel: np.ndarray, quant_mult: int, quant_bits: int) -> bytes:
     # Quantize
     quant = np.floor(channel / quant_mult + 0.5).astype(np.int16)
@@ -278,13 +306,15 @@ def embed_dc_in_channel(channel: np.ndarray, quant_mult: int, quant_bits: int) -
     blocks = blocks[..., ZZ_ROWS, ZZ_COLS]
 
     # Find DC values (top left coefficent)
-    dc = blocks[..., 0]
+    dc = blocks[..., 0].astype(np.int8)
 
     # Clip AC values
     limit = 1 << (quant_bits - 1)
     ac = np.clip(blocks[..., 1:], -limit, limit - 1).astype(np.int8)
+    ac[..., 7:] = 0 # Keep only the 8 largest AC values
+    trunc_ac = truncate_zero_runs(ac)
 
-    return dc.tobytes() + pack_signed(ac, quant_bits)
+    return dc.tobytes() + pack_signed(trunc_ac, quant_bits)
 
 
 def _save(image: Image.Image, fp: BinaryIO, _filename: str | bytes) -> None:
