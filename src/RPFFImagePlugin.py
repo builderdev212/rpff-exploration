@@ -10,11 +10,10 @@ RPFF File Format Layout:
 
 from typing import BinaryIO
 import numpy as np
-from scipy.fft import dctn, idctn
+from scipy.fft import dctn, idctn, dstn, idstn
 from PIL import Image, ImageFile
-from dahuffman import HuffmanCodec
 
-TF_BLOCK_SIZE = 8
+TF_BLOCK_SIZE = 16
 QUANT_Y_MULT = 30
 QUANT_CHROMA_MULT = 60
 QUANT_Y_BITS = 3
@@ -49,7 +48,7 @@ def zigzag_indices() -> tuple[np.ndarray, np.ndarray]:
 
 ZZ_ROWS, ZZ_COLS = zigzag_indices()
 
-
+#RPFF: 0.615% - PSNR (22.2)
 def transform_blocks(channel: np.ndarray, inverse: bool = False) -> np.ndarray:
     # Format into blocks
     if not inverse:
@@ -176,8 +175,8 @@ class RPFFDecoder(ImageFile.PyDecoder):
     def _upscale_chroma_array(
         self, channel: np.ndarray, width: int, height: int
     ) -> np.ndarray:
-        channel = channel.repeat(2, axis=0)  # Duplicate rows
-        channel = channel.repeat(2, axis=1)  # Duplicate columns
+        channel = channel.repeat(4, axis=0)  # Duplicate rows
+        channel = channel.repeat(4, axis=1)  # Duplicate columns
         channel = channel[:height, :width]  # Truncate
         return channel
 
@@ -187,8 +186,8 @@ class RPFFDecoder(ImageFile.PyDecoder):
         height = self.state.ysize
 
         # Get data from file
-        chroma_width = (width + 1) // 2
-        chroma_height = (height + 1) // 2
+        chroma_width = (width + 3) // 4
+        chroma_height = (height + 3) // 4
 
         y = self._read_channel(height, width, QUANT_Y_BITS)
         cb = self._read_channel(chroma_height, chroma_width, QUANT_CHROMA_BITS)
@@ -266,11 +265,11 @@ def chroma_subsample(channel: np.ndarray) -> np.ndarray:
     height, width = channel.shape
 
     # Use np to pad size for averaging by copying edge data
-    channel = np.pad(channel, ((0, height % 2), (0, width % 2)), mode="edge")
+    channel = np.pad(channel, ((0, (-height) % 4), (0, (-width) % 4)), mode="edge")
 
     # reshape the data into 2x2 blocks to average
     height, width = channel.shape
-    channel = channel.reshape(height // 2, 2, width // 2, 2)
+    channel = channel.reshape(height // 4, 4, width // 4, 4)
 
     # average the values to cut the size in half and convert back to 8 bit
     channel = np.floor(channel.mean(axis=(1, 3)) + 0.5).astype(np.uint8)
@@ -311,7 +310,7 @@ def embed_dc_in_channel(channel: np.ndarray, quant_mult: int, quant_bits: int) -
     # Clip AC values
     limit = 1 << (quant_bits - 1)
     ac = np.clip(blocks[..., 1:], -limit, limit - 1).astype(np.int8)
-    ac[..., 7:] = 0 # Keep only the 8 largest AC values
+    ac[..., 8:] = 0 # Keep only the 8 largest AC values
     trunc_ac = truncate_zero_runs(ac)
 
     return dc.tobytes() + pack_signed(trunc_ac, quant_bits)
