@@ -2,3 +2,6 @@ numpy
 scipy
 Pillow
 scikit-image
+pandas
+matplotlib
+adjustText
