@@ -1,11 +1,9 @@
 """
 RPFF File Format Layout:
-    (32B) Header -
+    (12B) Header -
      ├─(4B)  Signature "RPFF"
-     ├─(1B)  Version "1" (uint8)
      ├─(4B)  Width "640" (uint32)
-     ├─(4B)  Height "480" (uint32)
-     └─(19B) Undefined
+     └─(4B)  Height "480" (uint32)
 """
 
 from typing import BinaryIO
